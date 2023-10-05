@@ -1,0 +1,344 @@
+Parameters:
+  ImageUrl:
+    Description: Image url of DockerHub
+    Type: String
+    Default: koh124/vite-app
+
+  FargateContainerPort:
+    Description: Port number of container of Fargate task
+    Type: Number
+    Default: 8080
+
+Resources:
+  # VPCネットワークを構築する
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      # CIDR表記"10.0.0.0/16": 上位16ビットがネットワークアドレス、下位16ビットがホストアドレス
+      # IP範囲: 10.0.0.0 ~ 10.0.255.255 （ネットワーク&ブロードキャストアドレスを除く）
+      CidrBlock: 10.0.0.0/16
+      Tags:
+        - Key: "VPCName"
+          Value: "mainVPC"
+
+  # セキュリティグループを作成する
+  # セキュリティグループはインスタンスレベル（EC2、Fargate）でのインバウンド・アウトバウンドの許可ルール
+  # ステートフルな制御が特徴で、インバウンドトラフィックを許可すると、対応するアウトバウンドが自動的に許可される
+  SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Allow inbound traffic on port 8080"
+      VpcId: !Ref "VPC"
+      # インバウンドトラフィックのルールを規定する
+      # インターネット全体（0.0.0.0/0） → ポート8080 のTCPインバウンドトラフィックを許可する
+      # 対応するアウトバウンドトラフィックも自動的に有効になる
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          # ポートの設定を範囲にすれば、連続した複数のポートを一気に開放することもできる
+          FromPort: !Ref FargateContainerPort
+          ToPort: !Ref FargateContainerPort
+          CidrIp: "0.0.0.0/0"
+      # # デフォルトですべてのアウトバウンドトラフィックが許可されているので、無効にする
+      # SecurityGroupEgress:
+      #   - IpProtocol: -1
+      #     CidrIp: "0.0.0.0/0"
+
+  # ELB用のセキュリティグループ
+  SecurityGroupForElb:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Allow inbound traffic on port 80"
+      VpcId: !Ref "VPC"
+      SecurityGroupIngress:
+        # ELBがインターネットからのリクエストを受け付けるポート（HTTP）を解放する
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+
+  # 公開サブネットを構築する
+  # ただし、デフォルトではプライベートサブネットになっている
+  # VPCでサブネットが公開かプライベートか決定するのは、ルートテーブルのルートの指定による
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.1.0/24
+      VpcId: !Ref VPC
+      # この設定がtrueだと、サブネットに配置されるEC2インスタンスやFargateタスクに自動的にパブリックIPアドレスが割り当てられる
+      MapPublicIpOnLaunch: false
+      # アベイラビリティゾーンを分散させる
+      AvailabilityZone: ap-northeast-1a
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.2.0/24
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: ap-northeast-1c
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.3.0/24
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: ap-northeast-1a
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.4.0/24
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: ap-northeast-1c
+
+  # VPCのリソース（公開サブネットの場合）がインターネットと接続するためのステップ
+  # 1. インターネットゲートウェイをVPCにアタッチする
+  # 2. ルートテーブルにIGW → 0.0.0.0/0（インターネット全体）へのルートを作る
+
+  # インターネットゲートウェイを作成する
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  # こちらのリソースは、インターネットゲートウェイをVPCに関連付ける
+  # マネジメントコンソールからインターネットゲートウェイを見ると、
+  # 最初に作成したVPC（VPC ID）に対して、状態が"Attached"になっている
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # 公開サブネット用のルートテーブルを作成する
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  # 公開サブネット用のルートテーブルで、
+  # IGW → インターネット全体へのルートを作る
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      GatewayId: !Ref InternetGateway
+      DestinationCidrBlock: "0.0.0.0/0"
+
+  # 公開サブネットとルートテーブルの明示的な関連付けを行う
+  # ルートテーブルには、"明示的なサブネットの関連付けと、明示的でないサブネットの関連付けがある
+  # 明示的な関連づけを行わないと、サブネットはデフォルトでメインルートテーブルと関連づけられる
+  PublicSubnetRouteTableAssociations:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociations:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # NATゲートウェイに割り当てられるEIP（Elastic IP）を作る
+  # NATゲートウェイからインターネットにアウトバウンド接続する際、EIPをソースIPとして使用する
+  NatEip:
+    Type: AWS::EC2::EIP
+
+  NatEip2:
+    Type: AWS::EC2::EIP
+
+  # NATゲートウェイを作成する
+  # NATゲートウェイは公開サブネットに配置され、プライベートサブネットのリソースがインターネットにアクセスする入り口を作る
+  # プライベートサブネット → NATゲートウェイ(公開サブネット) → インターネットゲートウェイ → インターネット で 外部にアクセスできるようになる
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      # NatEIPとNATGatewayはマルチAZ構成にすることで、冗長化できる
+      SubnetId: !Ref PublicSubnet
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+
+  # プライベートサブネット用のルートテーブルを作成する
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  # プライベートサブネット用のルートを作成
+  # プライベートサブネット内からのインターネット全体へのアウトバウンド接続を、NATゲートウェイに転送させるルートを作る
+  # プライベートサブネットのFargateタスクがDockerHubからイメージをpullする際は、これを通る
+  # NATゲートウェイはリソースに代わってインターネットにアクセスしてくれる
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      NatGatewayId: !Ref NatGateway
+      DestinationCidrBlock: "0.0.0.0/0"
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      NatGatewayId: !Ref NatGateway2
+      DestinationCidrBlock: "0.0.0.0/0"
+
+  # プライベートサブネットとプライベートサブネット用のルートテーブルで明示的な関連付けを行う
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # ELB（ロードバランサー）を作成する
+  # ELBは公開サブネットに配置されていたら外部からアクセス可能で、ELBが配置されているいずれかのAZのターゲットにトラフィックをルーティングする
+  # プライベートサブネットに配置されていたら、インターネットからアクセスすることはできない
+  # 今回は対応するELBとFargateのAZを統一し、同じAZのプライベートサブネットのFargateタスクにリクエストを転送する構成にした
+  # ELBはAWSの内部インフラストラクチャによって動的な公開IPを持ち、専用のドメインで外部インターネットからのHTTPリクエストを受け取る
+  LoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+    # インバウンドトラフィックを複数のターゲット（Fargateタスクなど）に分散させる
+    # トラフィックは異なるAZに分散できる
+    # Fargateが ap-northeast-1a, ap-northeast-1d のプライベートサブネットに配置されていて、
+    # ELBが ap-northeast-1a, ap-northeast-1c の公開サブネットに配置されていたら、
+    # Fargateが1dにデプロイされた際にELBから1dのプライベートサブネットにルーティングされないので、ヘルスチェックが完了できなくなる
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref SecurityGroupForElb
+
+  # ELBのターゲットグループを作成する
+  # ターゲットグループ内の複数のターゲットに、トラフィックが分散されて、ルーティングされる
+  LoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn:
+      - LoadBalancer
+    Properties:
+      Name: ELBTargetGroupForECS
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: !Ref FargateContainerPort
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: !Ref FargateContainerPort
+      HealthCheckPath: '/'
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetType: ip
+      LoadBalancerArns:
+        - !Ref LoadBalancer
+
+  # ELBのリスナーを作成する
+  # ポート80（HTTP）でのリクエストを受け取り、ターゲットグループに転送する
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - LoadBalancer
+      - LoadBalancerTargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LoadBalancerTargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+
+  # ECSクラスターを作成する
+  ECSCluster:
+    Type: "AWS::ECS::Cluster"
+
+  # ECSタスクの実行ロールを作成する
+  # ECSTaskExecutionRole:
+  #   Type: 'AWS::IAM::Role'
+  #   Properties:
+  #     AssumeRolePolicyDocument:
+  #       Version: '2012-10-17'
+  #       Statement:
+  #         - Effect: 'Allow'
+  #           Principal:
+  #             Service:
+  #               - 'ecs-tasks.amazonaws.com'
+  #           Action:
+  #             - 'sts:AssumeRole'
+  #     Policies:
+  #       - PolicyName: 'ECSExecutionPolicy'
+  #         PolicyDocument:
+  #           Version: '2012-10-17'
+  #           Statement:
+  #             - Effect: 'Allow'
+  #               Action:
+  #                 - 'ecs:Describe*'
+  #                 - 'ecs:List*'
+  #                 - 'ecr:GetAuthorizationToken'
+  #                 - 'ecr:BatchCheckLayerAvailability'
+  #                 - 'ecr:GetDownloadUrlForLayer'
+  #                 - 'logs:CreateLogStream'
+  #                 - 'logs:PutLogEvents'
+  #               Resource: '*'
+
+  # タスク定義を作成する
+  ECSTaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      Family: "ecs-family"
+      Cpu: "512"
+      # Cpu: "256"
+      Memory: "1024"
+      # Memory: "512"
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - "FARGATE"
+      # 今回はデフォルトで作成されている実行ロールを使う
+      ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/ecsTaskExecutionRole"
+      # ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      ContainerDefinitions:
+        - Name: "web"
+          Image: !Ref ImageUrl
+          PortMappings:
+            - ContainerPort: !Ref FargateContainerPort
+
+  # ECSサービスを作成する
+  Service:
+    Type: "AWS::ECS::Service"
+    Properties:
+      Cluster: !Ref ECSCluster
+      # 起動タイプはFargate
+      LaunchType: "FARGATE"
+      TaskDefinition: !Ref ECSTaskDefinition
+      # タスクは常に2体を維持する
+      DesiredCount: 2
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # パブリックIPアドレスを割り当てないようにする（プライベートサブネットに配置させる）
+          AssignPublicIp: DISABLED
+          # プライベートサブネットに配置させる
+          Subnets:
+            - !Ref PrivateSubnet
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref SecurityGroup
+      # ロードバランサーと統合する
+      LoadBalancers:
+        - TargetGroupArn: !Ref LoadBalancerTargetGroup
+          ContainerName: web
+          ContainerPort: !Ref FargateContainerPort
